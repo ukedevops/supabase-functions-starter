@@ -7,10 +7,17 @@ on:
 
   workflow_dispatch:
     inputs:
-      functions:
-        description: "Functions to deploy (comma separated or 'all')"
-        required: true
-        default: "all"
+      hello_world:
+        type: boolean
+        default: false
+  
+      send_email:
+        type: boolean
+        default: false
+  
+      payment_webhook:
+        type: boolean
+        default: false
 
 jobs:
   deploy:
