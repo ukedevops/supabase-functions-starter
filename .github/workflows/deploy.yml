@@ -1,0 +1,203 @@
+name: Deploy Supabase Functions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Detect and Deploy Functions
+    runs-on: ubuntu-latest
+
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_ID: ${{ secrets.STAGING_PROJECT_ID }}
+
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 2
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Show deployment information
+        run: |
+          echo "======================================"
+          echo "Supabase Functions Deployment"
+          echo "======================================"
+          echo "Branch : ${{ github.ref_name }}"
+          echo "Commit : ${{ github.sha }}"
+          echo "Project: $SUPABASE_PROJECT_ID"
+          echo "======================================"
+
+      - name: Detect changed functions
+        id: changes
+        shell: bash
+        run: |
+          set -e
+
+          echo "Checking Supabase function changes..."
+
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD || true)
+
+          echo ""
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          FUNCTIONS=$(echo "$CHANGED_FILES" \
+            | grep '^supabase/functions/' \
+            | cut -d '/' -f 3 \
+            | grep -v '^_shared$' \
+            | sort -u || true)
+
+          echo ""
+          echo "Changed functions:"
+          echo "$FUNCTIONS"
+
+          if [ -z "$FUNCTIONS" ]; then
+            echo "No Supabase function changes detected."
+
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "functions<<EOF"
+            echo "$FUNCTIONS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Link Supabase project
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          supabase link \
+            --project-ref "$SUPABASE_PROJECT_ID"
+
+      - name: Deploy changed functions
+        if: steps.changes.outputs.has_changes == 'true'
+        id: deploy
+        shell: bash
+        run: |
+          set -e
+
+          FUNCTIONS="${{ steps.changes.outputs.functions }}"
+
+          DEPLOYED=""
+          FAILED=""
+
+          echo "======================================"
+          echo "Deploying changed functions"
+          echo "======================================"
+
+          while IFS= read -r FUNCTION
+          do
+            [ -z "$FUNCTION" ] && continue
+
+            echo ""
+            echo "--------------------------------------"
+            echo "Deploying: $FUNCTION"
+            echo "--------------------------------------"
+
+            if supabase functions deploy "$FUNCTION" \
+              --project-ref "$SUPABASE_PROJECT_ID"
+            then
+              echo "SUCCESS: $FUNCTION"
+
+              DEPLOYED="${DEPLOYED}${FUNCTION}"$'\n'
+            else
+              echo "FAILED: $FUNCTION"
+
+              FAILED="${FAILED}${FUNCTION}"$'\n'
+            fi
+
+          done <<< "$FUNCTIONS"
+
+          {
+            echo "deployed<<EOF"
+            echo "$DEPLOYED"
+            echo "EOF"
+
+            echo "failed<<EOF"
+            echo "$FAILED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FAILED" ]; then
+            echo ""
+            echo "One or more functions failed to deploy."
+            exit 1
+          fi
+
+      - name: Generate deployment summary
+        if: always()
+        shell: bash
+        run: |
+          echo "# 🚀 Supabase Functions Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Deployment Information" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | \`${{ github.ref_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Project | \`${SUPABASE_PROJECT_ID}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Trigger | Manual |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.changes.outputs.has_changes }}" != "true" ]; then
+
+            echo "## ℹ️ No Function Changes" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No changes were detected inside \`supabase/functions/\`." >> "$GITHUB_STEP_SUMMARY"
+
+            exit 0
+          fi
+
+          echo "## Changed Functions" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| Function | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          DEPLOYED="${{ steps.deploy.outputs.deployed }}"
+          FAILED="${{ steps.deploy.outputs.failed }}"
+
+          if [ -n "$DEPLOYED" ]; then
+            while IFS= read -r FUNCTION
+            do
+              [ -z "$FUNCTION" ] && continue
+
+              echo "| \`$FUNCTION\` | ✅ Deployed |" >> "$GITHUB_STEP_SUMMARY"
+
+            done <<< "$DEPLOYED"
+          fi
+
+          if [ -n "$FAILED" ]; then
+            while IFS= read -r FUNCTION
+            do
+              [ -z "$FUNCTION" ] && continue
+
+              echo "| \`$FUNCTION\` | ❌ Failed |" >> "$GITHUB_STEP_SUMMARY"
+
+            done <<< "$FAILED"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$FAILED" ]; then
+            echo "## ❌ Deployment Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "One or more Supabase functions failed to deploy." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ✅ Deployment Completed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "All changed Supabase functions were deployed successfully." >> "$GITHUB_STEP_SUMMARY"
+          fi
