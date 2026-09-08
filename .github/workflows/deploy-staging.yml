@@ -2,15 +2,61 @@ name: Deploy Staging
 
 on:
   push:
-    branches: [staging]
+    branches:
+      - staging
+
   workflow_dispatch:
+    inputs:
+      functions:
+        description: "Functions to deploy (comma separated or 'all')"
+        required: true
+        default: "all"
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
+    env:
+      SUPABASE_ACCESS_TOKEN: ''
+      SUPABASE_PROJECT_ID: ''
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: supabase/setup-cli@v1
         with:
           version: latest
-      - run: supabase functions deploy
+
+      - name: Link Project
+        run: |
+          supabase link \
+            --project-ref $SUPABASE_PROJECT_ID
+
+      - name: List Available Functions
+        run: |
+          echo "Available functions:"
+          find supabase/functions -mindepth 1 -maxdepth 1 -type d -exec basename {} \;
+
+      - name: Deploy Functions
+        run: |
+          FUNCTIONS="${{ github.event.inputs.functions }}"
+
+          if [ "$FUNCTIONS" = "all" ]; then
+            echo "Deploying all functions..."
+            supabase functions deploy
+            exit 0
+          fi
+
+          IFS=',' read -ra LIST <<< "$FUNCTIONS"
+
+          for fn in "${LIST[@]}"; do
+            fn=$(echo "$fn" | xargs)
+
+            if [ -d "supabase/functions/$fn" ]; then
+              echo "Deploying: $fn"
+              supabase functions deploy "$fn"
+            else
+              echo "Function not found: $fn"
+              exit 1
+            fi
+          done
