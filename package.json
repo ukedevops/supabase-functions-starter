@@ -1,0 +1,9 @@
+{
+  "name": "supabase-functions",
+  "private": true,
+  "scripts": {
+    "start": "supabase start",
+    "db:push": "supabase db push",
+    "functions:deploy": "supabase functions deploy"
+  }
+}
