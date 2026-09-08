@@ -1,56 +1,218 @@
-name: Deploy Changed Functions
+```yaml
+name: Deploy Supabase Functions to Staging
 
 on:
   workflow_dispatch:
 
 jobs:
-  deploy:
+  detect-changes:
+    name: Detect Changed Functions
     runs-on: ubuntu-latest
 
-    # env:
-    #   SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-    #   SUPABASE_PROJECT_ID: ${{ secrets.STAGING_PROJECT_ID }}
+    outputs:
+      functions: ${{ steps.changed-functions.outputs.functions }}
+      has_changes: ${{ steps.changed-functions.outputs.has_changes }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
-      - uses: supabase/setup-cli@v1
+      - name: Detect changed Supabase functions
+        id: changed-functions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking changed files..."
+
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD || true)
+
+          echo "$CHANGED_FILES"
+
+          FUNCTIONS=()
+
+          while IFS= read -r file; do
+            if [[ "$file" =~ ^supabase/functions/([^/]+)/ ]]; then
+              FUNCTION="${BASH_REMATCH[1]}"
+
+              if [[ "$FUNCTION" != "_shared" ]]; then
+                FUNCTIONS+=("$FUNCTION")
+              fi
+            fi
+          done <<< "$CHANGED_FILES"
+
+          # Remove duplicates
+          UNIQUE_FUNCTIONS=$(printf "%s\n" "${FUNCTIONS[@]}" | sort -u)
+
+          if [[ -z "$UNIQUE_FUNCTIONS" ]]; then
+            echo "No Supabase function changes detected."
+
+            echo 'functions=[]' >> "$GITHUB_OUTPUT"
+            echo 'has_changes=false' >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          echo "Changed functions:"
+          echo "$UNIQUE_FUNCTIONS"
+
+          # Convert to JSON array
+          FUNCTIONS_JSON=$(printf '%s\n' "$UNIQUE_FUNCTIONS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          echo "Functions JSON:"
+          echo "$FUNCTIONS_JSON"
+
+          echo "functions=$FUNCTIONS_JSON" >> "$GITHUB_OUTPUT"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy Changed Functions
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        function: ${{ fromJSON(needs.detect-changes.outputs.functions) }}
+
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_ID: ${{ secrets.STAGING_PROJECT_ID }}
+      FUNCTION_NAME: ${{ matrix.function }}
+
+    steps:
+      - name: Checkout current commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
         with:
           version: latest
 
-      # - name: Link Project
-      #   run: |
-      #     supabase link --project-ref $SUPABASE_PROJECT_ID
-
-      - name: Detect Changed Functions
-        id: changed
+      - name: Link Supabase project
         run: |
-          FUNCTIONS=$(git diff --name-only \
-            ${{ github.event.before }} \
-            ${{ github.sha }} |
-            grep '^supabase/functions/' |
-            cut -d'/' -f3 |
-            sort -u || true)
+          supabase link \
+            --project-ref "$SUPABASE_PROJECT_ID"
 
-          echo "Detected functions:"
-          echo "$FUNCTIONS"
-
-          {
-            echo "functions<<EOF"
-            echo "$FUNCTIONS"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Deploy Changed Functions
-        if: steps.changed.outputs.functions != ''
+      - name: Validate function exists
         run: |
-          while read fn
-          do
-            [ -z "$fn" ] && continue
+          if [ ! -d "supabase/functions/$FUNCTION_NAME" ]; then
+            echo "Function directory not found:"
+            echo "supabase/functions/$FUNCTION_NAME"
+            exit 1
+          fi
 
-            echo "Deploying $fn"
+      - name: Deploy function
+        id: deploy
+        run: |
+          set -euo pipefail
 
-            supabase functions deploy "$fn"
-          done <<< "${{ steps.changed.outputs.functions }}"
+          echo "Deploying function: $FUNCTION_NAME"
+
+          supabase functions deploy "$FUNCTION_NAME" \
+            --project-ref "$SUPABASE_PROJECT_ID"
+
+      - name: Wait for deployment
+        run: |
+          echo "Waiting for Supabase deployment to become available..."
+
+          sleep 10
+
+      - name: Health check
+        id: health-check
+        env:
+          SUPABASE_URL: ${{ secrets.STAGING_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.STAGING_SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+
+          FUNCTION_URL="${SUPABASE_URL}/functions/v1/${FUNCTION_NAME}"
+
+          echo "Checking:"
+          echo "$FUNCTION_URL"
+
+          HTTP_STATUS=$(curl \
+            --silent \
+            --show-error \
+            --output /tmp/function-response.txt \
+            --write-out "%{http_code}" \
+            --max-time 30 \
+            --request GET \
+            --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            "$FUNCTION_URL")
+
+          echo "HTTP Status: $HTTP_STATUS"
+
+          echo "Response:"
+          cat /tmp/function-response.txt || true
+
+          # Treat 2xx and 3xx as successful.
+          if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$|^3[0-9][0-9]$ ]]; then
+            echo "Health check passed."
+            exit 0
+          fi
+
+          echo "Health check failed."
+          exit 1
+
+      - name: Checkout previous version
+        if: failure()
+        run: |
+          set -euo pipefail
+
+          echo "Preparing rollback..."
+
+          git checkout HEAD^ -- "supabase/functions/$FUNCTION_NAME"
+
+      - name: Rollback function
+        if: failure()
+        run: |
+          set -euo pipefail
+
+          echo "Rolling back function:"
+          echo "$FUNCTION_NAME"
+
+          supabase functions deploy "$FUNCTION_NAME" \
+            --project-ref "$SUPABASE_PROJECT_ID"
+
+      - name: Verify rollback
+        if: failure()
+        env:
+          SUPABASE_URL: ${{ secrets.STAGING_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.STAGING_SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+
+          FUNCTION_URL="${SUPABASE_URL}/functions/v1/${FUNCTION_NAME}"
+
+          echo "Checking rolled-back function..."
+
+          HTTP_STATUS=$(curl \
+            --silent \
+            --show-error \
+            --output /tmp/rollback-response.txt \
+            --write-out "%{http_code}" \
+            --max-time 30 \
+            --request GET \
+            --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            "$FUNCTION_URL")
+
+          echo "Rollback HTTP Status: $HTTP_STATUS"
+
+          cat /tmp/rollback-response.txt || true
+
+          if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$|^3[0-9][0-9]$ ]]; then
+            echo "Rollback health check passed."
+          else
+            echo "Rollback health check FAILED."
+            exit 1
+          fi
+
+          exit 1
+```
