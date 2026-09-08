@@ -1,0 +1,6 @@
+{
+  "hello-world": true,
+  "send-email": false,
+  "payment-webhook": true,
+  "user-sync": true
+}

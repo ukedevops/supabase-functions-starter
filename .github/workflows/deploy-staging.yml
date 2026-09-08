@@ -11,27 +11,27 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    env:
-      SUPABASE_ACCESS_TOKEN: ''
-      SUPABASE_PROJECT_ID: ''
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: supabase/setup-cli@v1
-        with:
-          version: latest
-
-      - run: |
-          supabase link \
-            --project-ref $SUPABASE_PROJECT_ID
 
       - name: Deploy Selected Functions
         run: |
-          IFS=',' read -ra FUNCTIONS <<< "${{ github.event.inputs.functions }}"
+          echo '${{ inputs.functions }}' > functions.json
 
-          for fn in "${FUNCTIONS[@]}"; do
-            fn=$(echo "$fn" | xargs)
+          jq -r '
+            to_entries[]
+            | select(.value == true)
+            | .key
+          ' functions.json | while read fn
+          do
             echo "Deploying $fn"
-            supabase functions deploy "$fn"
+
+            if [ -d "supabase/functions/$fn" ]; then
+              supabase functions deploy "$fn"
+            else
+              echo "Function not found: $fn"
+              exit 1
+            fi
           done
