@@ -1,23 +1,11 @@
-name: Deploy Staging
+name: Deploy Functions
 
 on:
-  push:
-    branches:
-      - staging
-
   workflow_dispatch:
     inputs:
-      hello_world:
-        type: boolean
-        default: false
-  
-      send_email:
-        type: boolean
-        default: false
-  
-      payment_webhook:
-        type: boolean
-        default: false
+      functions:
+        description: "Comma separated function names"
+        required: true
 
 jobs:
   deploy:
@@ -34,36 +22,16 @@ jobs:
         with:
           version: latest
 
-      - name: Link Project
-        run: |
+      - run: |
           supabase link \
             --project-ref $SUPABASE_PROJECT_ID
 
-      - name: List Available Functions
+      - name: Deploy Selected Functions
         run: |
-          echo "Available functions:"
-          find supabase/functions -mindepth 1 -maxdepth 1 -type d -exec basename {} \;
+          IFS=',' read -ra FUNCTIONS <<< "${{ github.event.inputs.functions }}"
 
-      - name: Deploy Functions
-        run: |
-          FUNCTIONS="${{ github.event.inputs.functions }}"
-
-          if [ "$FUNCTIONS" = "all" ]; then
-            echo "Deploying all functions..."
-            supabase functions deploy
-            exit 0
-          fi
-
-          IFS=',' read -ra LIST <<< "$FUNCTIONS"
-
-          for fn in "${LIST[@]}"; do
+          for fn in "${FUNCTIONS[@]}"; do
             fn=$(echo "$fn" | xargs)
-
-            if [ -d "supabase/functions/$fn" ]; then
-              echo "Deploying: $fn"
-              supabase functions deploy "$fn"
-            else
-              echo "Function not found: $fn"
-              exit 1
-            fi
+            echo "Deploying $fn"
+            supabase functions deploy "$fn"
           done
