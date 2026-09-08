@@ -1,37 +1,56 @@
-name: Deploy Functions
+name: Deploy Changed Functions
 
 on:
   workflow_dispatch:
-    inputs:
-      functions:
-        description: "Comma separated function names"
-        required: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_ID: ${{ secrets.STAGING_PROJECT_ID }}
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: supabase/setup-cli@v1
+        with:
+          version: latest
 
-      - name: Deploy Selected Functions
+      - name: Link Project
         run: |
-          echo '${{ inputs.functions }}' > functions.json
+          supabase link --project-ref $SUPABASE_PROJECT_ID
 
-          jq -r '
-            to_entries[]
-            | select(.value == true)
-            | .key
-          ' functions.json | while read fn
+      - name: Detect Changed Functions
+        id: changed
+        run: |
+          FUNCTIONS=$(git diff --name-only \
+            ${{ github.event.before }} \
+            ${{ github.sha }} |
+            grep '^supabase/functions/' |
+            cut -d'/' -f3 |
+            sort -u || true)
+
+          echo "Detected functions:"
+          echo "$FUNCTIONS"
+
+          {
+            echo "functions<<EOF"
+            echo "$FUNCTIONS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Changed Functions
+        if: steps.changed.outputs.functions != ''
+        run: |
+          while read fn
           do
+            [ -z "$fn" ] && continue
+
             echo "Deploying $fn"
 
-            if [ -d "supabase/functions/$fn" ]; then
-              supabase functions deploy "$fn"
-            else
-              echo "Function not found: $fn"
-              exit 1
-            fi
-          done
+            supabase functions deploy "$fn"
+          done <<< "${{ steps.changed.outputs.functions }}"
