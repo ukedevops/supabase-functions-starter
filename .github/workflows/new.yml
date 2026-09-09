@@ -1,0 +1,553 @@
+```yaml
+# ============================================================
+# Supabase Edge Functions - Staging Deployment
+#
+# Purpose:
+#   - Manual deployment only
+#   - Select the branch from GitHub Actions
+#   - Detect changed Edge Functions
+#   - Deploy only affected functions
+#   - Allow explicit function override
+#   - Allow explicit base ref/SHA
+#   - Detect _shared and config.toml changes
+#   - Generate deployment summary
+#
+# Important:
+#   - This workflow does NOT deploy all functions by default.
+#   - Changes to _shared require explicit function selection.
+#   - Changes to supabase/config.toml require explicit
+#     function selection.
+#
+# Keep only ONE staging Edge Functions deployment workflow.
+# ============================================================
+
+name: Deploy Supabase Functions - Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      functions:
+        description: >
+          Optional comma-separated function names to deploy.
+          Example: invite-user,search-details
+        required: false
+        type: string
+        default: ""
+
+      base:
+        description: >
+          Optional base ref/SHA for change detection.
+          Leave empty to use the last successful deployment SHA
+          for this workflow on the selected branch.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  deploy:
+    name: Detect and Deploy Functions
+    runs-on: ubuntu-latest
+
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_ID: ${{ secrets.STAGING_PROJECT_ID }}
+
+      # Manual inputs are passed through environment variables
+      # instead of being embedded directly inside shell scripts.
+      INPUT_FUNCTIONS: ${{ inputs.functions }}
+      INPUT_BASE: ${{ inputs.base }}
+
+      BRANCH_NAME: ${{ github.ref_name }}
+      COMMIT_SHA: ${{ github.sha }}
+
+    steps:
+
+      # ========================================================
+      # Checkout
+      # ========================================================
+
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      # ========================================================
+      # Setup GitHub CLI
+      # ========================================================
+
+      - name: Setup GitHub CLI
+        run: |
+          gh --version
+
+      # ========================================================
+      # Show deployment information
+      # ========================================================
+
+      - name: Deployment information
+        run: |
+          echo "=============================================="
+          echo "Supabase Edge Functions - Staging"
+          echo "=============================================="
+          echo "Branch       : $BRANCH_NAME"
+          echo "Commit       : $COMMIT_SHA"
+          echo "Project      : $SUPABASE_PROJECT_ID"
+          echo "Manual input : ${INPUT_FUNCTIONS:-<none>}"
+          echo "Base input   : ${INPUT_BASE:-<auto>}"
+          echo "=============================================="
+
+      # ========================================================
+      # Setup Supabase CLI
+      # ========================================================
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # ========================================================
+      # Resolve base commit
+      # ========================================================
+
+      - name: Resolve comparison base
+        id: base
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INPUT_BASE" ]; then
+            BASE="$INPUT_BASE"
+
+            echo "Using manually supplied base:"
+            echo "$BASE"
+
+            git fetch --all --tags --prune
+
+            if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+              echo "ERROR: Base ref/SHA does not exist:"
+              echo "$BASE"
+              exit 1
+            fi
+
+          else
+            echo "No base supplied."
+
+            echo "Finding last successful run of this workflow..."
+
+            LAST_SUCCESS_SHA="$(
+              gh run list \
+                --workflow deploy-functions-staging.yml \
+                --branch "$BRANCH_NAME" \
+                --status success \
+                --json headSha \
+                --limit 1 \
+                --jq '.[0].headSha'
+            )"
+
+            if [ -z "$LAST_SUCCESS_SHA" ]; then
+              echo "ERROR: Could not find a previous successful deployment."
+              echo ""
+              echo "Please provide a base SHA/ref using the 'base' input."
+              exit 1
+            fi
+
+            BASE="$LAST_SUCCESS_SHA"
+
+            echo "Last successful deployment:"
+            echo "$BASE"
+
+            if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+              echo "Fetching missing base commit..."
+
+              git fetch origin "$BASE"
+
+              if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+                echo "ERROR: Unable to resolve base commit:"
+                echo "$BASE"
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "Resolved base:"
+          echo "$BASE"
+
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      # ========================================================
+      # Detect changed functions
+      # ========================================================
+
+      - name: Detect changed functions
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.base }}
+        run: |
+          set -euo pipefail
+
+          echo "=============================================="
+          echo "Detecting changes"
+          echo "=============================================="
+
+          echo "Base:"
+          echo "$BASE_SHA"
+
+          echo "HEAD:"
+          echo "$COMMIT_SHA"
+
+          CHANGED_FILES="$(
+            git diff \
+              --name-only \
+              "$BASE_SHA...HEAD"
+          )"
+
+          echo ""
+          echo "Changed files:"
+          echo "----------------------------------------------"
+          echo "$CHANGED_FILES"
+          echo "----------------------------------------------"
+
+          # ----------------------------------------------------
+          # Explicit function input
+          # ----------------------------------------------------
+
+          if [ -n "$INPUT_FUNCTIONS" ]; then
+
+            echo ""
+            echo "Explicit function list supplied."
+
+            FUNCTIONS="$(
+              printf '%s' "$INPUT_FUNCTIONS" |
+              tr ',' '\n' |
+              sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+              sed '/^$/d' |
+              sort -u
+            )"
+
+            # Validate every supplied function.
+            while IFS= read -r FUNCTION
+            do
+              [ -z "$FUNCTION" ] && continue
+
+              if [ ! -d "supabase/functions/$FUNCTION" ]; then
+                echo ""
+                echo "ERROR: Function does not exist:"
+                echo "supabase/functions/$FUNCTION"
+                exit 1
+              fi
+            done <<< "$FUNCTIONS"
+
+            echo ""
+            echo "Functions selected explicitly:"
+            echo "$FUNCTIONS"
+
+            {
+              echo "functions<<EOF"
+              echo "$FUNCTIONS"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            echo "source=manual" >> "$GITHUB_OUTPUT"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          # ----------------------------------------------------
+          # Detect shared code changes
+          # ----------------------------------------------------
+
+          SHARED_CHANGED="false"
+
+          if echo "$CHANGED_FILES" | grep -q '^supabase/functions/_shared/'; then
+            SHARED_CHANGED="true"
+          fi
+
+          # ----------------------------------------------------
+          # Detect config changes
+          # ----------------------------------------------------
+
+          CONFIG_CHANGED="false"
+
+          if echo "$CHANGED_FILES" | grep -q '^supabase/config.toml$'; then
+            CONFIG_CHANGED="true"
+          fi
+
+          # ----------------------------------------------------
+          # Shared/config changes require explicit selection
+          # ----------------------------------------------------
+
+          if [ "$SHARED_CHANGED" = "true" ] || [ "$CONFIG_CHANGED" = "true" ]; then
+
+            echo ""
+            echo "=============================================="
+            echo "Manual function selection required"
+            echo "=============================================="
+
+            if [ "$SHARED_CHANGED" = "true" ]; then
+              echo "_shared changes detected."
+            fi
+
+            if [ "$CONFIG_CHANGED" = "true" ]; then
+              echo "supabase/config.toml changes detected."
+            fi
+
+            echo ""
+            echo "These changes can affect multiple functions."
+            echo ""
+            echo "Please re-run the workflow and provide:"
+            echo ""
+            echo "functions:"
+            echo "function-a,function-b,function-c"
+            echo ""
+
+            exit 1
+          fi
+
+          # ----------------------------------------------------
+          # Detect function directories
+          # ----------------------------------------------------
+
+          FUNCTIONS="$(
+            echo "$CHANGED_FILES" |
+            grep '^supabase/functions/' |
+            cut -d '/' -f 3 |
+            sort -u |
+            while IFS= read -r FUNCTION
+            do
+              if [ -d "supabase/functions/$FUNCTION" ]; then
+                echo "$FUNCTION"
+              fi
+            done
+          )"
+
+          FUNCTIONS="$(
+            echo "$FUNCTIONS" |
+            sed '/^$/d' |
+            sort -u
+          )"
+
+          echo ""
+          echo "Detected functions:"
+          echo "$FUNCTIONS"
+
+          if [ -z "$FUNCTIONS" ]; then
+
+            echo ""
+            echo "No Edge Function changes detected."
+
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "source=diff" >> "$GITHUB_OUTPUT"
+
+            {
+              echo "functions<<EOF"
+              echo ""
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          {
+            echo "functions<<EOF"
+            echo "$FUNCTIONS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "source=diff" >> "$GITHUB_OUTPUT"
+
+      # ========================================================
+      # Link Supabase
+      # ========================================================
+
+      - name: Link Supabase project
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+
+          supabase link \
+            --project-ref "$SUPABASE_PROJECT_ID"
+
+      # ========================================================
+      # Deploy functions
+      # ========================================================
+
+      - name: Deploy functions
+        id: deploy
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          FUNCTIONS: ${{ steps.changes.outputs.functions }}
+        run: |
+          set -uo pipefail
+
+          DEPLOYED=""
+          FAILED=""
+
+          echo "=============================================="
+          echo "Deploying Functions"
+          echo "=============================================="
+
+          while IFS= read -r FUNCTION
+          do
+            [ -z "$FUNCTION" ] && continue
+
+            echo ""
+            echo "----------------------------------------------"
+            echo "Deploying: $FUNCTION"
+            echo "----------------------------------------------"
+
+            if supabase functions deploy "$FUNCTION" \
+              --project-ref "$SUPABASE_PROJECT_ID"
+            then
+              echo "SUCCESS: $FUNCTION"
+
+              DEPLOYED="${DEPLOYED}${FUNCTION}"$'\n'
+            else
+              echo "FAILED: $FUNCTION"
+
+              FAILED="${FAILED}${FUNCTION}"$'\n'
+            fi
+
+          done <<< "$FUNCTIONS"
+
+          {
+            echo "deployed<<EOF"
+            echo "$DEPLOYED"
+            echo "EOF"
+
+            echo "failed<<EOF"
+            echo "$FAILED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FAILED" ]; then
+            echo ""
+            echo "One or more functions failed."
+
+            exit 1
+          fi
+
+      # ========================================================
+      # Deployment summary
+      # ========================================================
+
+      - name: Generate deployment summary
+        if: always()
+        shell: bash
+        env:
+          FUNCTIONS: ${{ steps.changes.outputs.functions }}
+          DEPLOYED: ${{ steps.deploy.outputs.deployed }}
+          FAILED: ${{ steps.deploy.outputs.failed }}
+          HAS_CHANGES: ${{ steps.changes.outputs.has_changes }}
+          CHANGE_SOURCE: ${{ steps.changes.outputs.source }}
+          BASE_SHA: ${{ steps.base.outputs.base }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+        run: |
+          set -u
+
+          {
+            echo "# 🚀 Supabase Functions - Staging"
+            echo ""
+
+            echo "## Deployment Information"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Branch | \`$BRANCH_NAME\` |"
+            echo "| Commit | \`$COMMIT_SHA\` |"
+            echo "| Base | \`$BASE_SHA\` |"
+            echo "| Project | \`$SUPABASE_PROJECT_ID\` |"
+            echo "| Trigger | Manual |"
+            echo "| Detection | ${CHANGE_SOURCE:-unknown} |"
+            echo ""
+
+            if [ "${HAS_CHANGES:-false}" != "true" ]; then
+
+              echo "## ℹ️ No Function Changes"
+              echo ""
+              echo "No Edge Function changes were detected."
+              echo ""
+
+            else
+
+              echo "## Changed Functions"
+              echo ""
+              echo "| Function | Status |"
+              echo "|---|---|"
+
+              if [ -n "${DEPLOYED:-}" ]; then
+                while IFS= read -r FUNCTION
+                do
+                  [ -z "$FUNCTION" ] && continue
+
+                  echo "| \`$FUNCTION\` | ✅ Deployed |"
+
+                done <<< "$DEPLOYED"
+              fi
+
+              if [ -n "${FAILED:-}" ]; then
+                while IFS= read -r FUNCTION
+                do
+                  [ -z "$FUNCTION" ] && continue
+
+                  echo "| \`$FUNCTION\` | ❌ Failed |"
+
+                done <<< "$FAILED"
+              fi
+
+              echo ""
+
+              case "${DEPLOY_OUTCOME:-unknown}" in
+
+                success)
+                  echo "## ✅ Deployment Completed"
+                  echo ""
+                  echo "All selected functions were deployed successfully."
+                  ;;
+
+                failure)
+                  echo "## ❌ Deployment Failed"
+                  echo ""
+                  echo "One or more functions failed to deploy."
+                  ;;
+
+                skipped)
+                  echo "## ⏭️ Deployment Skipped"
+                  echo ""
+                  echo "No deployment was performed."
+                  ;;
+
+                cancelled)
+                  echo "## 🛑 Deployment Cancelled"
+                  echo ""
+                  echo "The deployment was cancelled."
+                  ;;
+
+                *)
+                  echo "## ⚠️ Deployment Status Unknown"
+                  echo ""
+                  echo "The deployment step did not complete normally."
+                  ;;
+
+              esac
+
+            fi
+
+            echo ""
+            echo "---"
+            echo ""
+            echo "Workflow: \`${GITHUB_WORKFLOW}\`"
+            echo ""
+            echo "Run: \`${GITHUB_RUN_ID}\`"
+
+          } >> "$GITHUB_STEP_SUMMARY"
+```
