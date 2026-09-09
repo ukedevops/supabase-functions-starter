@@ -1,4 +1,3 @@
-```yaml
 # ============================================================
 # Supabase Edge Functions - Staging Deployment
 #
@@ -550,4 +549,3 @@ jobs:
             echo "Run: \`${GITHUB_RUN_ID}\`"
 
           } >> "$GITHUB_STEP_SUMMARY"
-```
