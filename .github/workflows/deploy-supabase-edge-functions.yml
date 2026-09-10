@@ -119,10 +119,10 @@ jobs:
       - name: Resolve environment credentials
         shell: bash
         env:
-          STAGING_ACCESS_TOKEN: ${{ secrets.STAGING_SUPABASE_ACCESS_TOKEN }}
-          STAGING_PROJECT_ID:   ${{ secrets.STAGING_SUPABASE_PROJECT_ID }}
-          PRODUCTION_ACCESS_TOKEN: ${{ secrets.PRODUCTION_SUPABASE_ACCESS_TOKEN }}
-          PRODUCTION_PROJECT_ID:   ${{ secrets.PRODUCTION_SUPABASE_PROJECT_ID }}
+          STAGING_ACCESS_TOKEN: ''
+          STAGING_PROJECT_ID:   ''
+          PRODUCTION_ACCESS_TOKEN: ''
+          PRODUCTION_PROJECT_ID:  ''
         run: |
           set -euo pipefail
 
