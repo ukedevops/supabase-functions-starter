@@ -106,28 +106,29 @@ jobs:
       # ========================================================
       # Resolve environment-specific credentials
       #
-      # GitHub Actions cannot pick a secret name dynamically inside
-      # the job-level `env:` block, so we resolve it here and export
-      # it to $GITHUB_ENV for subsequent steps.
+      # Uses existing repository-level secrets directly:
+      #   - SUPABASE_ACCESS_TOKEN    (shared by both environments)
+      #   - STAGING_PROJECT_ID       (staging Supabase project ref)
+      #   - PRODUCTION_PROJECT_ID    (production Supabase project ref)
+      #
+      # Exports SUPABASE_ACCESS_TOKEN and SUPABASE_PROJECT_ID to
+      # $GITHUB_ENV so later steps (deploy, summary) can use them.
       # ========================================================
 
       - name: Resolve environment credentials
         shell: bash
         env:
-          STAGING_ACCESS_TOKEN: ''
-          STAGING_PROJECT_ID:   ''
-          PRODUCTION_ACCESS_TOKEN: ''
-          PRODUCTION_PROJECT_ID:  ''
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          STAGING_PROJECT_ID:    ${{ secrets.STAGING_PROJECT_ID }}
+          PRODUCTION_PROJECT_ID: ${{ secrets.PRODUCTION_PROJECT_ID }}
         run: |
           set -euo pipefail
 
           case "$INPUT_ENVIRONMENT" in
             staging)
-              ACCESS_TOKEN="$STAGING_ACCESS_TOKEN"
               PROJECT_ID="$STAGING_PROJECT_ID"
               ;;
             production)
-              ACCESS_TOKEN="$PRODUCTION_ACCESS_TOKEN"
               PROJECT_ID="$PRODUCTION_PROJECT_ID"
               ;;
             *)
@@ -136,21 +137,23 @@ jobs:
               ;;
           esac
 
-          if [ -z "$ACCESS_TOKEN" ]; then
+          if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
             echo "ERROR: Missing SUPABASE access token for environment: $INPUT_ENVIRONMENT"
+            echo "       Check that repository secret SUPABASE_ACCESS_TOKEN is set."
             exit 1
           fi
 
           if [ -z "$PROJECT_ID" ]; then
             echo "ERROR: Missing SUPABASE project ID for environment: $INPUT_ENVIRONMENT"
+            echo "       Check that repository secret STAGING_PROJECT_ID or PRODUCTION_PROJECT_ID is set."
             exit 1
           fi
 
           # Mask token in logs.
-          echo "::add-mask::$ACCESS_TOKEN"
+          echo "::add-mask::$SUPABASE_ACCESS_TOKEN"
 
           {
-            echo "SUPABASE_ACCESS_TOKEN=$ACCESS_TOKEN"
+            echo "SUPABASE_ACCESS_TOKEN=$SUPABASE_ACCESS_TOKEN"
             echo "SUPABASE_PROJECT_ID=$PROJECT_ID"
           } >> "$GITHUB_ENV"
 
