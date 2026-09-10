@@ -1,37 +1,56 @@
 # ============================================================
-# Supabase Edge Functions - Staging Deployment
+# Supabase Edge Functions - Deployment (Staging + Production)
 #
 # Purpose:
 #   - Manual deployment only
+#   - Choose environment (staging | production) via workflow_dispatch
 #   - Select the branch from GitHub Actions
 #   - Detect changed Edge Functions
 #   - Deploy only affected functions
 #   - Allow explicit function override
 #   - Allow explicit base ref/SHA
 #   - Detect _shared and config.toml changes
-#   - Generate deployment summary
-#
-# Base resolution order:
-#   1. Manually supplied base SHA/ref
-#   2. Last successful deployment SHA
-#   3. HEAD^ (previous commit on selected branch)
+#   - Generate an accurate deployment summary
 #
 # Important:
 #   - This workflow does NOT deploy all functions by default.
+#   - Explicit function selection bypasses change detection.
 #   - Changes to _shared require explicit function selection.
-#   - Changes to supabase/config.toml require explicit
-#     function selection.
+#   - Changes to supabase/config.toml require explicit function selection.
+#   - No supabase link is performed.
+#   - No database migrations are performed.
 #
-# Keep only ONE staging Edge Functions deployment workflow.
+# Base resolution order when functions input is empty:
+#   1. Manually supplied base SHA/ref
+#   2. Last successful deployment of this workflow on the same branch
+#      AND same environment
+#   3. Fail if no base can be resolved
+#
+# Required secrets (per GitHub Environment):
+#   environment: staging
+#     STAGING_SUPABASE_ACCESS_TOKEN
+#     STAGING_SUPABASE_PROJECT_ID
+#   environment: production
+#     PRODUCTION_SUPABASE_ACCESS_TOKEN
+#     PRODUCTION_SUPABASE_PROJECT_ID
 # ============================================================
 
-name: Deploy Supabase Functions - Staging
+name: Deploy Supabase Functions
 
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
       functions:
-        description: >
+        description: >-
           Optional comma-separated function names to deploy.
           Example: invite-user,search-details
         required: false
@@ -39,10 +58,10 @@ on:
         default: ""
 
       base:
-        description: >
+        description: >-
           Optional base ref/SHA for change detection.
-          Leave empty to use the last successful deployment SHA.
-          If no successful deployment exists, HEAD^ is used.
+          Leave empty to use the last successful deployment of this workflow
+          on the selected branch and environment.
         required: false
         type: string
         default: ""
@@ -53,14 +72,16 @@ permissions:
 
 jobs:
   deploy:
-    name: Detect and Deploy Functions
+    name: Detect and Deploy Functions (${{ inputs.environment }})
     runs-on: ubuntu-latest
 
-    env:
-      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-      SUPABASE_PROJECT_ID: ${{ secrets.STAGING_PROJECT_ID }}
+    # The selected GitHub Environment controls both credentials and
+    # optional protection/approval rules (required reviewers, wait timers).
+    environment:
+      name: ${{ inputs.environment }}
 
-      # Manual inputs
+    env:
+      INPUT_ENVIRONMENT: ${{ inputs.environment }}
       INPUT_FUNCTIONS: ${{ inputs.functions }}
       INPUT_BASE: ${{ inputs.base }}
 
@@ -68,7 +89,6 @@ jobs:
       COMMIT_SHA: ${{ github.sha }}
 
     steps:
-
       # ========================================================
       # Checkout
       # ========================================================
@@ -85,16 +105,70 @@ jobs:
 
       - name: Setup GitHub CLI
         run: |
+          set -euo pipefail
           gh --version
 
       # ========================================================
-      # Show deployment information
+      # Resolve environment-specific credentials
+      #
+      # GitHub Actions cannot pick a secret name dynamically inside
+      # the job-level `env:` block, so we resolve it here and export
+      # it to $GITHUB_ENV for subsequent steps.
+      # ========================================================
+
+      - name: Resolve environment credentials
+        shell: bash
+        env:
+          STAGING_ACCESS_TOKEN: ${{ secrets.STAGING_SUPABASE_ACCESS_TOKEN }}
+          STAGING_PROJECT_ID:   ${{ secrets.STAGING_SUPABASE_PROJECT_ID }}
+          PRODUCTION_ACCESS_TOKEN: ${{ secrets.PRODUCTION_SUPABASE_ACCESS_TOKEN }}
+          PRODUCTION_PROJECT_ID:   ${{ secrets.PRODUCTION_SUPABASE_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+
+          case "$INPUT_ENVIRONMENT" in
+            staging)
+              ACCESS_TOKEN="$STAGING_ACCESS_TOKEN"
+              PROJECT_ID="$STAGING_PROJECT_ID"
+              ;;
+            production)
+              ACCESS_TOKEN="$PRODUCTION_ACCESS_TOKEN"
+              PROJECT_ID="$PRODUCTION_PROJECT_ID"
+              ;;
+            *)
+              echo "ERROR: Unsupported environment: $INPUT_ENVIRONMENT"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "ERROR: Missing SUPABASE access token for environment: $INPUT_ENVIRONMENT"
+            exit 1
+          fi
+
+          if [ -z "$PROJECT_ID" ]; then
+            echo "ERROR: Missing SUPABASE project ID for environment: $INPUT_ENVIRONMENT"
+            exit 1
+          fi
+
+          # Mask token in logs.
+          echo "::add-mask::$ACCESS_TOKEN"
+
+          {
+            echo "SUPABASE_ACCESS_TOKEN=$ACCESS_TOKEN"
+            echo "SUPABASE_PROJECT_ID=$PROJECT_ID"
+          } >> "$GITHUB_ENV"
+
+      # ========================================================
+      # Deployment information
       # ========================================================
 
       - name: Deployment information
         run: |
+          set -euo pipefail
+
           echo "=============================================="
-          echo "Supabase Edge Functions - Staging"
+          echo "Supabase Edge Functions - $INPUT_ENVIRONMENT"
           echo "=============================================="
           echo "Branch       : $BRANCH_NAME"
           echo "Commit       : $COMMIT_SHA"
@@ -114,10 +188,14 @@ jobs:
 
       # ========================================================
       # Resolve comparison base
+      #
+      # Filtered by BOTH branch AND environment so staging and
+      # production never cross-contaminate each other's history.
       # ========================================================
 
       - name: Resolve comparison base
         id: base
+        if: ${{ env.INPUT_FUNCTIONS == '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -128,16 +206,17 @@ jobs:
           echo "Resolving comparison base"
           echo "=============================================="
 
-          # ----------------------------------------------------
+          BASE=""
+
+          # ------------------------------------------------------
           # 1. Manual base supplied
-          # ----------------------------------------------------
+          # ------------------------------------------------------
 
           if [ -n "$INPUT_BASE" ]; then
+            echo "Using manually supplied base:"
+            echo "$INPUT_BASE"
 
             BASE="$INPUT_BASE"
-
-            echo "Using manually supplied base:"
-            echo "$BASE"
 
             git fetch --all --tags --prune
 
@@ -149,35 +228,40 @@ jobs:
             fi
 
           else
-
-            # --------------------------------------------------
-            # 2. Find last successful deployment
-            # --------------------------------------------------
+            # ----------------------------------------------------
+            # 2. Last successful deployment for THIS environment
+            #
+            # GitHub's `gh run list` does not expose workflow_dispatch
+            # inputs directly, so we filter by the run's displayTitle,
+            # which includes the environment name because the job name
+            # is "Detect and Deploy Functions (<environment>)".
+            # ----------------------------------------------------
 
             echo "No base supplied."
-            echo "Finding last successful deployment..."
+            echo "Finding the last successful deployment for environment:"
+            echo "$INPUT_ENVIRONMENT"
+            echo "Workflow: $GITHUB_WORKFLOW"
+            echo "Branch  : $BRANCH_NAME"
 
             LAST_SUCCESS_SHA="$(
               gh run list \
-                --workflow supabase-functions-staging.yml \
+                --workflow "$GITHUB_WORKFLOW" \
                 --branch "$BRANCH_NAME" \
                 --status success \
-                --json headSha \
-                --limit 1 \
-                --jq '.[0].headSha // empty'
+                --json headSha,displayTitle \
+                --limit 50 \
+                --jq ".[] | select(.displayTitle | test(\"($INPUT_ENVIRONMENT)\")) | .headSha" \
+                | head -n1
             )"
 
             if [ -n "$LAST_SUCCESS_SHA" ]; then
-
               BASE="$LAST_SUCCESS_SHA"
 
               echo ""
-              echo "Last successful deployment found:"
+              echo "Last successful $INPUT_ENVIRONMENT deployment found:"
               echo "$BASE"
 
-              # Make sure the commit exists locally.
               if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
-
                 echo ""
                 echo "Fetching missing base commit..."
 
@@ -189,43 +273,26 @@ jobs:
                   echo "$BASE"
                   exit 1
                 fi
-
               fi
 
             else
-
-              # ------------------------------------------------
-              # 3. No successful deployment -> HEAD^ fallback
-              # ------------------------------------------------
-
               echo ""
-              echo "No previous successful deployment found."
-              echo "Using HEAD^ as fallback."
-
-              if ! git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-
-                echo ""
-                echo "ERROR: HEAD^ does not exist."
-                echo "This branch may contain only one commit."
-                echo ""
-                echo "Please provide a base SHA/ref using the 'base' input."
-                exit 1
-
-              fi
-
-              BASE="$(git rev-parse HEAD^)"
-
+              echo "ERROR: Could not find a previous successful $INPUT_ENVIRONMENT deployment."
               echo ""
-              echo "Fallback base:"
-              echo "$BASE"
-
+              echo "This is expected for the first deployment of this environment."
+              echo ""
+              echo "Please provide either:"
+              echo "  functions: function-a,function-b"
+              echo "or:"
+              echo "  base: <branch/ref/SHA>"
+              echo ""
+              exit 1
             fi
-
           fi
 
-          # ----------------------------------------------------
+          # ------------------------------------------------------
           # Final validation
-          # ----------------------------------------------------
+          # ------------------------------------------------------
 
           if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
             echo ""
@@ -255,18 +322,85 @@ jobs:
           set -euo pipefail
 
           echo "=============================================="
-          echo "Detecting changes"
+          echo "Detecting changed functions"
           echo "=============================================="
 
+          # ------------------------------------------------------
+          # Explicit function input
+          # ------------------------------------------------------
+
+          if [ -n "$INPUT_FUNCTIONS" ]; then
+            echo ""
+            echo "Explicit function list supplied."
+            echo "Automatic change detection will be skipped."
+
+            FUNCTIONS="$(
+              printf '%s' "$INPUT_FUNCTIONS" |
+                tr ',' '\n' |
+                sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+                sed '/^$/d' |
+                sort -u
+            )"
+
+            if [ -z "$FUNCTIONS" ]; then
+              echo ""
+              echo "ERROR: The functions input did not contain any function names."
+              exit 1
+            fi
+
+            while IFS= read -r FUNCTION; do
+              [ -z "$FUNCTION" ] && continue
+
+              if ! printf '%s' "$FUNCTION" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+                echo ""
+                echo "ERROR: Invalid function name:"
+                echo "$FUNCTION"
+                echo "Allowed characters: A-Z, a-z, 0-9, underscore, hyphen."
+                exit 1
+              fi
+
+              if [ ! -d "supabase/functions/$FUNCTION" ]; then
+                echo ""
+                echo "ERROR: Function does not exist:"
+                echo "supabase/functions/$FUNCTION"
+                exit 1
+              fi
+            done <<< "$FUNCTIONS"
+
+            echo ""
+            echo "Functions selected explicitly:"
+            echo "$FUNCTIONS"
+
+            {
+              echo "functions<<EOF"
+              echo "$FUNCTIONS"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "source=manual" >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          # ------------------------------------------------------
+          # Automatic change detection
+          # ------------------------------------------------------
+
+          if [ -z "$BASE_SHA" ]; then
+            echo ""
+            echo "ERROR: No comparison base was resolved."
+            echo "Please provide the 'base' input or explicit 'functions'."
+            exit 1
+          fi
+
+          echo ""
           echo "Base:"
           echo "$BASE_SHA"
 
+          echo ""
           echo "HEAD:"
           echo "$COMMIT_SHA"
-
-          # ----------------------------------------------------
-          # Get changed files
-          # ----------------------------------------------------
 
           CHANGED_FILES="$(
             git diff \
@@ -286,138 +420,78 @@ jobs:
 
           echo "----------------------------------------------"
 
-          # ----------------------------------------------------
-          # Explicit function input
-          # ----------------------------------------------------
-
-          if [ -n "$INPUT_FUNCTIONS" ]; then
-
-            echo ""
-            echo "Explicit function list supplied."
-
-            FUNCTIONS="$(
-              printf '%s' "$INPUT_FUNCTIONS" |
-              tr ',' '\n' |
-              sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
-              sed '/^$/d' |
-              sort -u
-            )"
-
-            # Validate every supplied function.
-            while IFS= read -r FUNCTION
-            do
-              [ -z "$FUNCTION" ] && continue
-
-              if [ ! -d "supabase/functions/$FUNCTION" ]; then
-                echo ""
-                echo "ERROR: Function does not exist:"
-                echo "supabase/functions/$FUNCTION"
-                exit 1
-              fi
-
-            done <<< "$FUNCTIONS"
-
-            echo ""
-            echo "Functions selected explicitly:"
-            echo "$FUNCTIONS"
-
-            {
-              echo "functions<<EOF"
-              echo "$FUNCTIONS"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-
-            echo "source=manual" >> "$GITHUB_OUTPUT"
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-
-            exit 0
-          fi
-
-          # ----------------------------------------------------
+          # ------------------------------------------------------
           # Detect shared code changes
-          # ----------------------------------------------------
+          # ------------------------------------------------------
 
-          SHARED_CHANGED="false"
-
-          if echo "$CHANGED_FILES" | grep -q '^supabase/functions/_shared/'; then
-            SHARED_CHANGED="true"
-          fi
-
-          # ----------------------------------------------------
-          # Detect config changes
-          # ----------------------------------------------------
-
-          CONFIG_CHANGED="false"
-
-          if echo "$CHANGED_FILES" | grep -q '^supabase/config.toml$'; then
-            CONFIG_CHANGED="true"
-          fi
-
-          # ----------------------------------------------------
-          # Shared/config changes require explicit selection
-          # ----------------------------------------------------
-
-          if [ "$SHARED_CHANGED" = "true" ] || [ "$CONFIG_CHANGED" = "true" ]; then
+          if printf '%s\n' "$CHANGED_FILES" |
+            grep -q '^supabase/functions/_shared/'; then
 
             echo ""
             echo "=============================================="
             echo "Manual function selection required"
             echo "=============================================="
-
-            if [ "$SHARED_CHANGED" = "true" ]; then
-              echo "_shared changes detected."
-            fi
-
-            if [ "$CONFIG_CHANGED" = "true" ]; then
-              echo "supabase/config.toml changes detected."
-            fi
-
             echo ""
-            echo "These changes can affect multiple functions."
+            echo "_shared changes detected."
             echo ""
-            echo "Please re-run the workflow and provide:"
+            echo "Shared code may affect multiple functions."
+            echo "Please re-run the workflow with:"
             echo ""
-            echo "functions:"
-            echo "function-a,function-b,function-c"
+            echo "functions: function-a,function-b,function-c"
             echo ""
-
             exit 1
           fi
 
-          # ----------------------------------------------------
-          # Detect function directories
-          # ----------------------------------------------------
+          # ------------------------------------------------------
+          # Detect Supabase function configuration changes
+          # ------------------------------------------------------
+
+          if printf '%s\n' "$CHANGED_FILES" |
+            grep -q '^supabase/config.toml$'; then
+
+            echo ""
+            echo "=============================================="
+            echo "Manual function selection required"
+            echo "=============================================="
+            echo ""
+            echo "supabase/config.toml changes detected."
+            echo ""
+            echo "Function configuration can affect deployment behavior."
+            echo "Please re-run the workflow with:"
+            echo ""
+            echo "functions: function-a,function-b,function-c"
+            echo ""
+            exit 1
+          fi
+
+          # ------------------------------------------------------
+          # Detect actual function directories only
+          # ------------------------------------------------------
 
           FUNCTIONS=""
 
-          while IFS= read -r FILE
-          do
+          while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
 
-            # Only process files under supabase/functions/
             case "$FILE" in
               supabase/functions/*)
                 FUNCTION="$(printf '%s' "$FILE" | cut -d '/' -f 3)"
 
-                # Ignore _shared
                 if [ "$FUNCTION" = "_shared" ]; then
                   continue
                 fi
 
-                # Make sure this is an actual function directory
                 if [ -d "supabase/functions/$FUNCTION" ]; then
                   FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
                 fi
                 ;;
             esac
-
           done <<< "$CHANGED_FILES"
 
-          # Remove duplicates and empty lines
           FUNCTIONS="$(
             printf '%s\n' "$FUNCTIONS" |
-            sed '/^$/d' |
-            sort -u
+              sed '/^$/d' |
+              sort -u
           )"
 
           echo ""
@@ -432,12 +506,11 @@ jobs:
 
           echo "----------------------------------------------"
 
-          # ----------------------------------------------------
+          # ------------------------------------------------------
           # No function changes
-          # ----------------------------------------------------
+          # ------------------------------------------------------
 
           if [ -z "$FUNCTIONS" ]; then
-
             echo ""
             echo "No Edge Function changes detected."
 
@@ -479,35 +552,29 @@ jobs:
           FAILED=""
 
           echo "=============================================="
-          echo "Deploying Functions"
+          echo "Deploying Functions - $INPUT_ENVIRONMENT"
           echo "=============================================="
 
-          while IFS= read -r FUNCTION
-          do
-
+          while IFS= read -r FUNCTION; do
             [ -z "$FUNCTION" ] && continue
 
             echo ""
             echo "----------------------------------------------"
-            echo "Deploying: $FUNCTION"
+            echo "Deploying: $FUNCTION ($INPUT_ENVIRONMENT)"
             echo "----------------------------------------------"
 
             if supabase functions deploy "$FUNCTION" \
-              --project-ref "$SUPABASE_PROJECT_ID"
-            then
+              --project-ref "$SUPABASE_PROJECT_ID"; then
 
               echo "SUCCESS: $FUNCTION"
-
               DEPLOYED="${DEPLOYED}${FUNCTION}"$'\n'
 
             else
 
               echo "FAILED: $FUNCTION"
-
               FAILED="${FAILED}${FUNCTION}"$'\n'
 
             fi
-
           done <<< "$FUNCTIONS"
 
           {
@@ -518,16 +585,12 @@ jobs:
             echo "failed<<EOF"
             echo "$FAILED"
             echo "EOF"
-
           } >> "$GITHUB_OUTPUT"
 
           if [ -n "$FAILED" ]; then
-
             echo ""
             echo "One or more functions failed."
-
             exit 1
-
           fi
 
       # ========================================================
@@ -544,63 +607,99 @@ jobs:
           HAS_CHANGES: ${{ steps.changes.outputs.has_changes }}
           CHANGE_SOURCE: ${{ steps.changes.outputs.source }}
           BASE_SHA: ${{ steps.base.outputs.base }}
+          BASE_OUTCOME: ${{ steps.base.outcome }}
+          CHANGES_OUTCOME: ${{ steps.changes.outcome }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
         run: |
           set -u
 
+          # Environment-aware title.
+          if [ "$INPUT_ENVIRONMENT" = "production" ]; then
+            TITLE_EMOJI="🚀"
+            TITLE_LABEL="Production"
+          else
+            TITLE_EMOJI="🧪"
+            TITLE_LABEL="Staging"
+          fi
+
           {
-            echo "# 🚀 Supabase Functions - Staging"
+            echo "# ${TITLE_EMOJI} Supabase Functions - ${TITLE_LABEL}"
             echo ""
 
             echo "## Deployment Information"
             echo ""
-
             echo "| Item | Value |"
             echo "|---|---|"
+            echo "| Environment | \`$INPUT_ENVIRONMENT\` |"
             echo "| Branch | \`$BRANCH_NAME\` |"
             echo "| Commit | \`$COMMIT_SHA\` |"
-            echo "| Base | \`$BASE_SHA\` |"
-            echo "| Project | \`$SUPABASE_PROJECT_ID\` |"
+            echo "| Base | \`${BASE_SHA:-not required}\` |"
+            echo "| Project | \`${SUPABASE_PROJECT_ID:-not resolved}\` |"
             echo "| Trigger | Manual |"
-            echo "| Detection | ${CHANGE_SOURCE:-unknown} |"
+            echo "| Detection | \`${CHANGE_SOURCE:-not completed}\` |"
             echo ""
 
-            if [ "${HAS_CHANGES:-false}" != "true" ]; then
+            # --------------------------------------------------
+            # Base resolution failed
+            # --------------------------------------------------
+
+            if [ "${BASE_OUTCOME:-}" = "failure" ]; then
+
+              echo "## ❌ Base Resolution Failed"
+              echo ""
+              echo "The workflow could not determine a comparison base."
+              echo ""
+              echo "For the first deployment, provide either:"
+              echo ""
+              echo "- \`functions: function-a,function-b\`"
+              echo "- \`base: <branch/ref/SHA>\`"
+              echo ""
+
+            # --------------------------------------------------
+            # Change detection failed
+            # --------------------------------------------------
+
+            elif [ "${CHANGES_OUTCOME:-}" = "failure" ]; then
+
+              echo "## ❌ Change Detection Failed"
+              echo ""
+              echo "The workflow could not determine which functions should be deployed."
+              echo ""
+
+            # --------------------------------------------------
+            # No changes
+            # --------------------------------------------------
+
+            elif [ "${HAS_CHANGES:-false}" != "true" ]; then
 
               echo "## ℹ️ No Function Changes"
               echo ""
               echo "No Edge Function changes were detected."
               echo ""
 
+            # --------------------------------------------------
+            # Functions selected/detected
+            # --------------------------------------------------
+
             else
 
-              echo "## Changed Functions"
+              echo "## Functions"
               echo ""
               echo "| Function | Status |"
               echo "|---|---|"
 
               if [ -n "${DEPLOYED:-}" ]; then
-
-                while IFS= read -r FUNCTION
-                do
+                while IFS= read -r FUNCTION; do
                   [ -z "$FUNCTION" ] && continue
-
                   echo "| \`$FUNCTION\` | ✅ Deployed |"
-
                 done <<< "$DEPLOYED"
-
               fi
 
               if [ -n "${FAILED:-}" ]; then
-
-                while IFS= read -r FUNCTION
-                do
+                while IFS= read -r FUNCTION; do
                   [ -z "$FUNCTION" ] && continue
-
                   echo "| \`$FUNCTION\` | ❌ Failed |"
-
                 done <<< "$FAILED"
-
               fi
 
               echo ""
@@ -632,7 +731,7 @@ jobs:
                   ;;
 
                 *)
-                  echo "## ⚠️ Deployment Status Unknown"
+                  echo "## ⚠️ Deployment Did Not Complete"
                   echo ""
                   echo "The deployment step did not complete normally."
                   ;;
@@ -644,8 +743,7 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "Workflow: \`${GITHUB_WORKFLOW}\`"
-            echo ""
-            echo "Run: \`${GITHUB_RUN_ID}\`"
+            echo "Workflow: \`$GITHUB_WORKFLOW\`"
+            echo "Run: \`$GITHUB_RUN_ID\`"
 
           } >> "$GITHUB_STEP_SUMMARY"
