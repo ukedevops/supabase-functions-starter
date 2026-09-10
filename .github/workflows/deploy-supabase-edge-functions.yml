@@ -73,12 +73,7 @@ permissions:
 jobs:
   deploy:
     name: Detect and Deploy Functions (${{ inputs.environment }})
-    runs-on: ubuntu-latest
-
-    # The selected GitHub Environment controls both credentials and
-    # optional protection/approval rules (required reviewers, wait timers).
-    environment:
-      name: ${{ inputs.environment }}
+    runs-on: ubuntu-latest    
 
     env:
       INPUT_ENVIRONMENT: ${{ inputs.environment }}
