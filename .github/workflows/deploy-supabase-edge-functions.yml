@@ -26,13 +26,10 @@
 #      AND same environment
 #   3. Fail if no base can be resolved
 #
-# Required secrets (per GitHub Environment):
-#   environment: staging
-#     STAGING_SUPABASE_ACCESS_TOKEN
-#     STAGING_SUPABASE_PROJECT_ID
-#   environment: production
-#     PRODUCTION_SUPABASE_ACCESS_TOKEN
-#     PRODUCTION_SUPABASE_PROJECT_ID
+# Required repository secrets:
+#   - SUPABASE_ACCESS_TOKEN    (shared by both environments)
+#   - STAGING_PROJECT_ID       (staging Supabase project ref)
+#   - PRODUCTION_PROJECT_ID    (production Supabase project ref)
 # ============================================================
 
 name: Deploy Supabase Functions
@@ -73,7 +70,7 @@ permissions:
 jobs:
   deploy:
     name: Detect and Deploy Functions (${{ inputs.environment }})
-    runs-on: ubuntu-latest    
+    runs-on: ubuntu-latest
 
     env:
       INPUT_ENVIRONMENT: ${{ inputs.environment }}
@@ -149,7 +146,6 @@ jobs:
             exit 1
           fi
 
-          # Mask token in logs.
           echo "::add-mask::$SUPABASE_ACCESS_TOKEN"
 
           {
@@ -611,7 +607,6 @@ jobs:
         run: |
           set -u
 
-          # Environment-aware title.
           if [ "$INPUT_ENVIRONMENT" = "production" ]; then
             TITLE_EMOJI="🚀"
             TITLE_LABEL="Production"
@@ -637,10 +632,6 @@ jobs:
             echo "| Detection | \`${CHANGE_SOURCE:-not completed}\` |"
             echo ""
 
-            # --------------------------------------------------
-            # Base resolution failed
-            # --------------------------------------------------
-
             if [ "${BASE_OUTCOME:-}" = "failure" ]; then
 
               echo "## ❌ Base Resolution Failed"
@@ -653,10 +644,6 @@ jobs:
               echo "- \`base: <branch/ref/SHA>\`"
               echo ""
 
-            # --------------------------------------------------
-            # Change detection failed
-            # --------------------------------------------------
-
             elif [ "${CHANGES_OUTCOME:-}" = "failure" ]; then
 
               echo "## ❌ Change Detection Failed"
@@ -664,20 +651,12 @@ jobs:
               echo "The workflow could not determine which functions should be deployed."
               echo ""
 
-            # --------------------------------------------------
-            # No changes
-            # --------------------------------------------------
-
             elif [ "${HAS_CHANGES:-false}" != "true" ]; then
 
               echo "## ℹ️ No Function Changes"
               echo ""
               echo "No Edge Function changes were detected."
               echo ""
-
-            # --------------------------------------------------
-            # Functions selected/detected
-            # --------------------------------------------------
 
             else
 
