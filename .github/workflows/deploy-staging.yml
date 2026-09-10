@@ -1,311 +1,651 @@
-name: Deploy Supabase Functions to Staging
+# ============================================================
+# Supabase Edge Functions - Staging Deployment
+#
+# Purpose:
+#   - Manual deployment only
+#   - Select the branch from GitHub Actions
+#   - Detect changed Edge Functions
+#   - Deploy only affected functions
+#   - Allow explicit function override
+#   - Allow explicit base ref/SHA
+#   - Detect _shared and config.toml changes
+#   - Generate deployment summary
+#
+# Base resolution order:
+#   1. Manually supplied base SHA/ref
+#   2. Last successful deployment SHA
+#   3. HEAD^ (previous commit on selected branch)
+#
+# Important:
+#   - This workflow does NOT deploy all functions by default.
+#   - Changes to _shared require explicit function selection.
+#   - Changes to supabase/config.toml require explicit
+#     function selection.
+#
+# Keep only ONE staging Edge Functions deployment workflow.
+# ============================================================
+
+name: Deploy Supabase Functions - Staging
 
 on:
   workflow_dispatch:
+    inputs:
+      functions:
+        description: >
+          Optional comma-separated function names to deploy.
+          Example: invite-user,search-details
+        required: false
+        type: string
+        default: ""
+
+      base:
+        description: >
+          Optional base ref/SHA for change detection.
+          Leave empty to use the last successful deployment SHA.
+          If no successful deployment exists, HEAD^ is used.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
-  id-token: write
+  actions: read
 
 jobs:
-  detect-changes:
-    name: Detect Changed Functions
-    runs-on: ubuntu-latest
-
-    outputs:
-      functions: ${{ steps.detect.outputs.functions }}
-      has_changes: ${{ steps.detect.outputs.has_changes }}
-
-    steps:
-      - name: Checkout selected branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 2
-
-      - name: Show branch information
-        run: |
-          echo "Branch: ${{ github.ref_name }}"
-          echo "Commit: ${{ github.sha }}"
-
-      - name: Detect changed functions
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking changed files..."
-
-          # Fix: Use git diff with proper base reference
-          if git rev-parse --verify HEAD^ &>/dev/null; then
-            CHANGED_FILES="$(git diff --name-only HEAD^ HEAD || true)"
-          else
-            # If only one commit exists, compare with empty tree
-            CHANGED_FILES="$(git diff --name-only --cached || true)"
-          fi
-
-          echo "Changed files:"
-          echo "$CHANGED_FILES"
-
-          FUNCTIONS=""
-
-          while IFS= read -r FILE; do
-            if [[ -n "$FILE" && "$FILE" =~ ^supabase/functions/([^/]+)/ ]]; then
-              FUNCTION="${BASH_REMATCH[1]}"
-
-              if [[ "$FUNCTION" != "_shared" ]]; then
-                FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
-              fi
-            fi
-          done <<< "$CHANGED_FILES"
-
-          UNIQUE_FUNCTIONS="$(printf '%s' "$FUNCTIONS" | sort -u | sed '/^$/d')"
-
-          if [ -z "$UNIQUE_FUNCTIONS" ]; then
-            echo "No Supabase function changes found."
-
-            echo 'functions=[]' >> "$GITHUB_OUTPUT"
-            echo 'has_changes=false' >> "$GITHUB_OUTPUT"
-
-            exit 0
-          fi
-
-          echo "Changed functions:"
-          echo "$UNIQUE_FUNCTIONS"
-
-          # Fix: Proper JSON formatting with jq
-          FUNCTIONS_JSON="$(echo "$UNIQUE_FUNCTIONS" | jq -R -s -c 'split("\n") | map(select(length > 0))')"
-
-          echo "Functions JSON:"
-          echo "$FUNCTIONS_JSON"
-
-          echo "functions=$FUNCTIONS_JSON" >> "$GITHUB_OUTPUT"
-          echo "has_changes=true" >> "$GITHUB_OUTPUT"
-
   deploy:
-    name: Deploy ${{ matrix.function }}
-    needs: detect-changes
-
-    if: needs.detect-changes.outputs.has_changes == 'true'
-
+    name: Detect and Deploy Functions
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        function: ${{ fromJSON(needs.detect-changes.outputs.functions) }}
 
     env:
       SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
       SUPABASE_PROJECT_ID: ${{ secrets.STAGING_PROJECT_ID }}
-      SUPABASE_URL: ${{ secrets.STAGING_SUPABASE_URL }}
-      SUPABASE_ANON_KEY: ${{ secrets.STAGING_SUPABASE_ANON_KEY }}
-      FUNCTION_NAME: ${{ matrix.function }}
+
+      # Manual inputs
+      INPUT_FUNCTIONS: ${{ inputs.functions }}
+      INPUT_BASE: ${{ inputs.base }}
+
+      BRANCH_NAME: ${{ github.ref_name }}
+      COMMIT_SHA: ${{ github.sha }}
 
     steps:
+
+      # ========================================================
+      # Checkout
+      # ========================================================
+
       - name: Checkout selected branch
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
-          fetch-depth: 0  # Fix: Full history for rollback
+          fetch-depth: 0
+
+      # ========================================================
+      # Setup GitHub CLI
+      # ========================================================
+
+      - name: Setup GitHub CLI
+        run: |
+          gh --version
+
+      # ========================================================
+      # Show deployment information
+      # ========================================================
+
+      - name: Deployment information
+        run: |
+          echo "=============================================="
+          echo "Supabase Edge Functions - Staging"
+          echo "=============================================="
+          echo "Branch       : $BRANCH_NAME"
+          echo "Commit       : $COMMIT_SHA"
+          echo "Project      : $SUPABASE_PROJECT_ID"
+          echo "Manual input : ${INPUT_FUNCTIONS:-<none>}"
+          echo "Base input   : ${INPUT_BASE:-<auto>}"
+          echo "=============================================="
+
+      # ========================================================
+      # Setup Supabase CLI
+      # ========================================================
 
       - name: Setup Supabase CLI
         uses: supabase/setup-cli@v1
         with:
           version: latest
 
-      - name: Show deployment information
-        run: |
-          echo "======================================"
-          echo "Supabase Function Deployment"
-          echo "======================================"
-          echo "Branch   : ${{ github.ref_name }}"
-          echo "Commit   : ${{ github.sha }}"
-          echo "Function : $FUNCTION_NAME"
-          echo "Project  : $SUPABASE_PROJECT_ID"
-          echo "======================================"
+      # ========================================================
+      # Resolve comparison base
+      # ========================================================
 
-      - name: Validate function
+      - name: Resolve comparison base
+        id: base
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          FUNCTION_PATH="supabase/functions/$FUNCTION_NAME"
+          echo "=============================================="
+          echo "Resolving comparison base"
+          echo "=============================================="
 
-          if [ ! -d "$FUNCTION_PATH" ]; then
-            echo "Function directory does not exist:"
-            echo "$FUNCTION_PATH"
+          # ----------------------------------------------------
+          # 1. Manual base supplied
+          # ----------------------------------------------------
+
+          if [ -n "$INPUT_BASE" ]; then
+
+            BASE="$INPUT_BASE"
+
+            echo "Using manually supplied base:"
+            echo "$BASE"
+
+            git fetch --all --tags --prune
+
+            if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+              echo ""
+              echo "ERROR: Base ref/SHA does not exist:"
+              echo "$BASE"
+              exit 1
+            fi
+
+          else
+
+            # --------------------------------------------------
+            # 2. Find last successful deployment
+            # --------------------------------------------------
+
+            echo "No base supplied."
+            echo "Finding last successful deployment..."
+
+            LAST_SUCCESS_SHA="$(
+              gh run list \
+                --workflow supabase-functions-staging.yml \
+                --branch "$BRANCH_NAME" \
+                --status success \
+                --json headSha \
+                --limit 1 \
+                --jq '.[0].headSha // empty'
+            )"
+
+            if [ -n "$LAST_SUCCESS_SHA" ]; then
+
+              BASE="$LAST_SUCCESS_SHA"
+
+              echo ""
+              echo "Last successful deployment found:"
+              echo "$BASE"
+
+              # Make sure the commit exists locally.
+              if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+
+                echo ""
+                echo "Fetching missing base commit..."
+
+                git fetch origin "$BASE"
+
+                if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+                  echo ""
+                  echo "ERROR: Unable to resolve base commit:"
+                  echo "$BASE"
+                  exit 1
+                fi
+
+              fi
+
+            else
+
+              # ------------------------------------------------
+              # 3. No successful deployment -> HEAD^ fallback
+              # ------------------------------------------------
+
+              echo ""
+              echo "No previous successful deployment found."
+              echo "Using HEAD^ as fallback."
+
+              if ! git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+
+                echo ""
+                echo "ERROR: HEAD^ does not exist."
+                echo "This branch may contain only one commit."
+                echo ""
+                echo "Please provide a base SHA/ref using the 'base' input."
+                exit 1
+
+              fi
+
+              BASE="$(git rev-parse HEAD^)"
+
+              echo ""
+              echo "Fallback base:"
+              echo "$BASE"
+
+            fi
+
+          fi
+
+          # ----------------------------------------------------
+          # Final validation
+          # ----------------------------------------------------
+
+          if ! git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1; then
+            echo ""
+            echo "ERROR: Unable to resolve comparison base:"
+            echo "$BASE"
             exit 1
           fi
 
-          echo "Function found:"
-          echo "$FUNCTION_PATH"
+          echo ""
+          echo "=============================================="
+          echo "Resolved base:"
+          echo "$BASE"
+          echo "=============================================="
 
-      - name: Link Supabase project
-        run: |
-          set -euo pipefail
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
-          supabase link \
-            --project-ref "$SUPABASE_PROJECT_ID"
+      # ========================================================
+      # Detect changed functions
+      # ========================================================
 
-      - name: Deploy function
-        id: deploy
-        run: |
-          set -euo pipefail
-
-          echo "Deploying function: $FUNCTION_NAME"
-
-          # Fix: Use correct deployment command
-          supabase functions deploy "$FUNCTION_NAME"
-
-      - name: Wait for deployment
-        run: |
-          echo "Waiting for deployment..."
-          sleep 15
-
-      - name: Health check
-        id: health
-        continue-on-error: true
+      - name: Detect changed functions
+        id: changes
         shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.base }}
         run: |
           set -euo pipefail
 
-          FUNCTION_URL="${SUPABASE_URL}/functions/v1/${FUNCTION_NAME}"
+          echo "=============================================="
+          echo "Detecting changes"
+          echo "=============================================="
 
-          echo "======================================"
-          echo "Health Check"
-          echo "======================================"
-          echo "URL: $FUNCTION_URL"
-          echo "======================================"
+          echo "Base:"
+          echo "$BASE_SHA"
 
-          # Fix: Better curl handling with retries
-          HTTP_STATUS="$( \
-            curl \
-              --silent \
-              --show-error \
-              --output /tmp/function-response.txt \
-              --write-out "%{http_code}" \
-              --max-time 30 \
-              --retry 3 \
-              --retry-delay 2 \
-              --request GET \
-              --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
-              --header "apikey: ${SUPABASE_ANON_KEY}" \
-              "$FUNCTION_URL" \
-            2>/dev/null || echo "000" \
+          echo "HEAD:"
+          echo "$COMMIT_SHA"
+
+          # ----------------------------------------------------
+          # Get changed files
+          # ----------------------------------------------------
+
+          CHANGED_FILES="$(
+            git diff \
+              --name-only \
+              "$BASE_SHA...HEAD"
           )"
 
-          echo "HTTP Status: $HTTP_STATUS"
+          echo ""
+          echo "Changed files:"
+          echo "----------------------------------------------"
 
-          if [ -f /tmp/function-response.txt ]; then
-            echo "Response:"
-            cat /tmp/function-response.txt || true
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "$CHANGED_FILES"
+          else
+            echo "No changed files."
           fi
 
-          if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
-            echo "Health check PASSED."
+          echo "----------------------------------------------"
+
+          # ----------------------------------------------------
+          # Explicit function input
+          # ----------------------------------------------------
+
+          if [ -n "$INPUT_FUNCTIONS" ]; then
+
+            echo ""
+            echo "Explicit function list supplied."
+
+            FUNCTIONS="$(
+              printf '%s' "$INPUT_FUNCTIONS" |
+              tr ',' '\n' |
+              sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+              sed '/^$/d' |
+              sort -u
+            )"
+
+            # Validate every supplied function.
+            while IFS= read -r FUNCTION
+            do
+              [ -z "$FUNCTION" ] && continue
+
+              if [ ! -d "supabase/functions/$FUNCTION" ]; then
+                echo ""
+                echo "ERROR: Function does not exist:"
+                echo "supabase/functions/$FUNCTION"
+                exit 1
+              fi
+
+            done <<< "$FUNCTIONS"
+
+            echo ""
+            echo "Functions selected explicitly:"
+            echo "$FUNCTIONS"
+
+            {
+              echo "functions<<EOF"
+              echo "$FUNCTIONS"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            echo "source=manual" >> "$GITHUB_OUTPUT"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
             exit 0
           fi
 
-          echo "Health check FAILED with status: $HTTP_STATUS"
-          exit 1
+          # ----------------------------------------------------
+          # Detect shared code changes
+          # ----------------------------------------------------
 
-      - name: Rollback function
-        if: steps.health.outcome == 'failure'
-        shell: bash
-        run: |
-          set -euo pipefail
+          SHARED_CHANGED="false"
 
-          echo "======================================"
-          echo "ROLLBACK STARTED"
-          echo "======================================"
+          if echo "$CHANGED_FILES" | grep -q '^supabase/functions/_shared/'; then
+            SHARED_CHANGED="true"
+          fi
 
-          echo "Function: $FUNCTION_NAME"
-          echo "Current commit: $GITHUB_SHA"
+          # ----------------------------------------------------
+          # Detect config changes
+          # ----------------------------------------------------
 
-          # Fix: Get previous commit safely
-          PREVIOUS_COMMIT="$(git rev-parse HEAD^ 2>/dev/null || echo "")"
+          CONFIG_CHANGED="false"
 
-          if [ -z "$PREVIOUS_COMMIT" ]; then
-            echo "No previous commit found. Skipping rollback."
+          if echo "$CHANGED_FILES" | grep -q '^supabase/config.toml$'; then
+            CONFIG_CHANGED="true"
+          fi
+
+          # ----------------------------------------------------
+          # Shared/config changes require explicit selection
+          # ----------------------------------------------------
+
+          if [ "$SHARED_CHANGED" = "true" ] || [ "$CONFIG_CHANGED" = "true" ]; then
+
+            echo ""
+            echo "=============================================="
+            echo "Manual function selection required"
+            echo "=============================================="
+
+            if [ "$SHARED_CHANGED" = "true" ]; then
+              echo "_shared changes detected."
+            fi
+
+            if [ "$CONFIG_CHANGED" = "true" ]; then
+              echo "supabase/config.toml changes detected."
+            fi
+
+            echo ""
+            echo "These changes can affect multiple functions."
+            echo ""
+            echo "Please re-run the workflow and provide:"
+            echo ""
+            echo "functions:"
+            echo "function-a,function-b,function-c"
+            echo ""
+
             exit 1
           fi
 
-          echo "Previous commit: $PREVIOUS_COMMIT"
+          # ----------------------------------------------------
+          # Detect function directories
+          # ----------------------------------------------------
 
-          # Fix: Use git checkout with proper path
-          git checkout "$PREVIOUS_COMMIT" -- \
-            "supabase/functions/$FUNCTION_NAME"
+          FUNCTIONS=""
 
-          echo "Previous function version restored."
+          while IFS= read -r FILE
+          do
+            [ -z "$FILE" ] && continue
 
-          supabase functions deploy "$FUNCTION_NAME"
+            # Only process files under supabase/functions/
+            case "$FILE" in
+              supabase/functions/*)
+                FUNCTION="$(printf '%s' "$FILE" | cut -d '/' -f 3)"
 
-          echo "Rollback deployment completed."
+                # Ignore _shared
+                if [ "$FUNCTION" = "_shared" ]; then
+                  continue
+                fi
 
-      - name: Wait for rollback
-        if: steps.health.outcome == 'failure'
-        run: |
-          echo "Waiting for rollback..."
-          sleep 15
+                # Make sure this is an actual function directory
+                if [ -d "supabase/functions/$FUNCTION" ]; then
+                  FUNCTIONS="${FUNCTIONS}${FUNCTION}"$'\n'
+                fi
+                ;;
+            esac
 
-      - name: Verify rollback
-        if: steps.health.outcome == 'failure'
-        shell: bash
-        run: |
-          set -euo pipefail
+          done <<< "$CHANGED_FILES"
 
-          FUNCTION_URL="${SUPABASE_URL}/functions/v1/${FUNCTION_NAME}"
-
-          echo "======================================"
-          echo "VERIFYING ROLLBACK"
-          echo "======================================"
-
-          HTTP_STATUS="$( \
-            curl \
-              --silent \
-              --show-error \
-              --output /tmp/rollback-response.txt \
-              --write-out "%{http_code}" \
-              --max-time 30 \
-              --retry 3 \
-              --retry-delay 2 \
-              --request GET \
-              --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
-              --header "apikey: ${SUPABASE_ANON_KEY}" \
-              "$FUNCTION_URL" \
-            2>/dev/null || echo "000" \
+          # Remove duplicates and empty lines
+          FUNCTIONS="$(
+            printf '%s\n' "$FUNCTIONS" |
+            sed '/^$/d' |
+            sort -u
           )"
 
-          echo "Rollback HTTP Status: $HTTP_STATUS"
+          echo ""
+          echo "Detected functions:"
+          echo "----------------------------------------------"
 
-          if [ -f /tmp/rollback-response.txt ]; then
-            echo "Rollback response:"
-            cat /tmp/rollback-response.txt || true
-          fi
-
-          if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
-            echo "Rollback verification PASSED."
+          if [ -n "$FUNCTIONS" ]; then
+            echo "$FUNCTIONS"
           else
-            echo "CRITICAL: Rollback verification FAILED."
-            exit 1
+            echo "None"
           fi
 
-      - name: Fail deployment after rollback
-        if: steps.health.outcome == 'failure'
-        run: |
-          echo "======================================"
-          echo "DEPLOYMENT FAILED - ROLLBACK COMPLETED"
-          echo "======================================"
-          echo "The new deployment failed health checks."
-          echo "The previous version was restored."
-          exit 1
+          echo "----------------------------------------------"
 
-      - name: Deployment successful
-        if: steps.health.outcome == 'success'
+          # ----------------------------------------------------
+          # No function changes
+          # ----------------------------------------------------
+
+          if [ -z "$FUNCTIONS" ]; then
+
+            echo ""
+            echo "No Edge Function changes detected."
+
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "source=diff" >> "$GITHUB_OUTPUT"
+
+            {
+              echo "functions<<EOF"
+              echo ""
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          {
+            echo "functions<<EOF"
+            echo "$FUNCTIONS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "source=diff" >> "$GITHUB_OUTPUT"
+
+      # ========================================================
+      # Deploy functions
+      # ========================================================
+
+      - name: Deploy functions
+        id: deploy
+        if: steps.changes.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          FUNCTIONS: ${{ steps.changes.outputs.functions }}
         run: |
-          echo "======================================"
-          echo "DEPLOYMENT SUCCESSFUL"
-          echo "======================================"
-          echo "Function: $FUNCTION_NAME"
-          echo "Branch: ${{ github.ref_name }}"
-          echo "Commit: ${{ github.sha }}"
+          set -uo pipefail
+
+          DEPLOYED=""
+          FAILED=""
+
+          echo "=============================================="
+          echo "Deploying Functions"
+          echo "=============================================="
+
+          while IFS= read -r FUNCTION
+          do
+
+            [ -z "$FUNCTION" ] && continue
+
+            echo ""
+            echo "----------------------------------------------"
+            echo "Deploying: $FUNCTION"
+            echo "----------------------------------------------"
+
+            if supabase functions deploy "$FUNCTION" \
+              --project-ref "$SUPABASE_PROJECT_ID"
+            then
+
+              echo "SUCCESS: $FUNCTION"
+
+              DEPLOYED="${DEPLOYED}${FUNCTION}"$'\n'
+
+            else
+
+              echo "FAILED: $FUNCTION"
+
+              FAILED="${FAILED}${FUNCTION}"$'\n'
+
+            fi
+
+          done <<< "$FUNCTIONS"
+
+          {
+            echo "deployed<<EOF"
+            echo "$DEPLOYED"
+            echo "EOF"
+
+            echo "failed<<EOF"
+            echo "$FAILED"
+            echo "EOF"
+
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FAILED" ]; then
+
+            echo ""
+            echo "One or more functions failed."
+
+            exit 1
+
+          fi
+
+      # ========================================================
+      # Deployment summary
+      # ========================================================
+
+      - name: Generate deployment summary
+        if: always()
+        shell: bash
+        env:
+          FUNCTIONS: ${{ steps.changes.outputs.functions }}
+          DEPLOYED: ${{ steps.deploy.outputs.deployed }}
+          FAILED: ${{ steps.deploy.outputs.failed }}
+          HAS_CHANGES: ${{ steps.changes.outputs.has_changes }}
+          CHANGE_SOURCE: ${{ steps.changes.outputs.source }}
+          BASE_SHA: ${{ steps.base.outputs.base }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+        run: |
+          set -u
+
+          {
+            echo "# 🚀 Supabase Functions - Staging"
+            echo ""
+
+            echo "## Deployment Information"
+            echo ""
+
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Branch | \`$BRANCH_NAME\` |"
+            echo "| Commit | \`$COMMIT_SHA\` |"
+            echo "| Base | \`$BASE_SHA\` |"
+            echo "| Project | \`$SUPABASE_PROJECT_ID\` |"
+            echo "| Trigger | Manual |"
+            echo "| Detection | ${CHANGE_SOURCE:-unknown} |"
+            echo ""
+
+            if [ "${HAS_CHANGES:-false}" != "true" ]; then
+
+              echo "## ℹ️ No Function Changes"
+              echo ""
+              echo "No Edge Function changes were detected."
+              echo ""
+
+            else
+
+              echo "## Changed Functions"
+              echo ""
+              echo "| Function | Status |"
+              echo "|---|---|"
+
+              if [ -n "${DEPLOYED:-}" ]; then
+
+                while IFS= read -r FUNCTION
+                do
+                  [ -z "$FUNCTION" ] && continue
+
+                  echo "| \`$FUNCTION\` | ✅ Deployed |"
+
+                done <<< "$DEPLOYED"
+
+              fi
+
+              if [ -n "${FAILED:-}" ]; then
+
+                while IFS= read -r FUNCTION
+                do
+                  [ -z "$FUNCTION" ] && continue
+
+                  echo "| \`$FUNCTION\` | ❌ Failed |"
+
+                done <<< "$FAILED"
+
+              fi
+
+              echo ""
+
+              case "${DEPLOY_OUTCOME:-unknown}" in
+
+                success)
+                  echo "## ✅ Deployment Completed"
+                  echo ""
+                  echo "All selected functions were deployed successfully."
+                  ;;
+
+                failure)
+                  echo "## ❌ Deployment Failed"
+                  echo ""
+                  echo "One or more functions failed to deploy."
+                  ;;
+
+                skipped)
+                  echo "## ⏭️ Deployment Skipped"
+                  echo ""
+                  echo "No deployment was performed."
+                  ;;
+
+                cancelled)
+                  echo "## 🛑 Deployment Cancelled"
+                  echo ""
+                  echo "The deployment was cancelled."
+                  ;;
+
+                *)
+                  echo "## ⚠️ Deployment Status Unknown"
+                  echo ""
+                  echo "The deployment step did not complete normally."
+                  ;;
+
+              esac
+
+            fi
+
+            echo ""
+            echo "---"
+            echo ""
+            echo "Workflow: \`${GITHUB_WORKFLOW}\`"
+            echo ""
+            echo "Run: \`${GITHUB_RUN_ID}\`"
+
+          } >> "$GITHUB_STEP_SUMMARY"
