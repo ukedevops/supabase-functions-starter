@@ -107,9 +107,9 @@ jobs:
       - name: Resolve environment credentials
         shell: bash
         env:
-          SECRET_SUPABASE_ACCESS_TOKEN: ''
-          SECRET_STAGING_PROJECT_ID:    ''
-          SECRET_PRODUCTION_PROJECT_ID: ''
+          SECRET_SUPABASE_ACCESS_TOKEN: 'ttryt'
+          SECRET_STAGING_PROJECT_ID:    'tytrytr'
+          SECRET_PRODUCTION_PROJECT_ID: 'trytrytr'
         run: |
           set -euo pipefail
 
